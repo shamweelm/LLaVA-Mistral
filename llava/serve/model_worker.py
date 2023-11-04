@@ -10,6 +10,10 @@ import uuid
 
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse
+
+from PIL import Image
+from io import BytesIO
+
 import requests
 import torch
 import uvicorn
@@ -19,11 +23,23 @@ from llava.constants import WORKER_HEART_BEAT_INTERVAL
 from llava.utils import (build_logger, server_error_msg,
     pretty_print_semaphore)
 from llava.model.builder import load_pretrained_model
-from llava.mm_utils import process_images, load_image_from_base64, tokenizer_image_token, KeywordsStoppingCriteria
-from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from transformers import TextIteratorStreamer
+from llava.mm_utils import (
+    process_images, load_image_from_base64, tokenizer_image_token,
+    KeywordsStoppingCriteria, get_model_name_from_path
+)
+from llava.constants import (
+    IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, 
+    DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, CONTROLLER_HEART_BEAT_EXPIRATION
+)
+from transformers import TextIteratorStreamer, TextStreamer
 from threading import Thread
 
+import dataclasses
+from enum import Enum, auto
+from typing import List, Union
+
+from llava.conversation import conv_templates, SeparatorStyle
+from llava.utils import disable_torch_init
 
 GB = 1 << 30
 
@@ -49,8 +65,11 @@ class ModelWorker:
         self.controller_addr = controller_addr
         self.worker_addr = worker_addr
         self.worker_id = worker_id
+
+        # model_path = BASE_PATH + self.model_path
         if model_path.endswith("/"):
             model_path = model_path[:-1]
+
         if model_name is None:
             model_paths = model_path.split("/")
             if model_paths[-1].startswith('checkpoint-'):
@@ -61,6 +80,7 @@ class ModelWorker:
             self.model_name = model_name
 
         self.device = device
+        self.conv_mode = None
         logger.info(f"Loading the model {self.model_name} on worker {worker_id} ...")
         self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(
             model_path, model_base, self.model_name, load_8bit, load_4bit, device=self.device)
@@ -216,6 +236,112 @@ class ModelWorker:
                 "error_code": 1,
             }
             yield json.dumps(ret).encode() + b"\0"
+    
+
+    def load_image(self, image_file):
+        if image_file.startswith('http://') or image_file.startswith('https://'):
+            response = requests.get(image_file)
+            image = Image.open(BytesIO(response.content)).convert('RGB')
+        else:
+            image = Image.open(image_file).convert('RGB')
+        return image
+    
+    def generate_image_caption(self, request):
+        # disable_torch_init()
+        
+        image_file = request["image_file"]
+        device = self.device
+
+        model_name = self.model_name
+        tokenizer = self.tokenizer
+        model = self.model
+        image_processor = self.image_processor
+        context_len = self.context_len
+
+
+        print(f"Loaded model: {model_name}")
+        print(f"Image processor: {image_processor}")
+        print(f"Context length: {context_len}")
+
+        if 'llama-2' in model_name.lower():
+            conv_mode = "llava_llama_2"
+        elif "v1" in model_name.lower():
+            conv_mode = "llava_v1"
+        elif "mpt" in model_name.lower():
+            conv_mode = "mpt"
+        else:
+            conv_mode = "llava_v0"
+
+        if self.conv_mode is not None and conv_mode != self.conv_mode:
+            print('[WARNING] the auto inferred conversation mode is {}, while `--conv-mode` is {}, using {}'.format(conv_mode, self.conv_mode, self.conv_mode))
+        else:
+            self.conv_mode = conv_mode
+
+        conv = conv_templates[self.conv_mode].copy()
+        if "mpt" in model_name.lower():
+            roles = ('user', 'assistant')
+        else:
+            roles = conv.roles
+
+        image = self.load_image(image_file)
+        # Similar operation in model_worker.py
+        image_tensor = process_images([image], image_processor, args)
+        if type(image_tensor) is list:
+            image_tensor = [image.to(model.device, dtype=torch.float16) for image in image_tensor]
+        else:
+            image_tensor = image_tensor.to(model.device, dtype=torch.float16)
+
+        
+        inp = request["prompt"]
+
+        print(f"{roles[1]}: ", end="")
+
+        if image is not None:
+            # first message
+            if model.config.mm_use_im_start_end:
+                inp = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + inp
+            else:
+                inp = DEFAULT_IMAGE_TOKEN + '\n' + inp
+            conv.append_message(conv.roles[0], inp)
+            image = None
+        else:
+            # later messages
+            conv.append_message(conv.roles[0], inp)
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
+
+        # input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
+        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(model.device)
+        stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+        keywords = [stop_str]
+        stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+        streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+        temperature = request["temperature"]
+        top_p = request["top_p"]
+        max_new_tokens = request["max_new_tokens"]
+        
+        with torch.inference_mode():
+            output_ids = model.generate(
+                input_ids,
+                images=image_tensor,
+                do_sample=True,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+                # streamer=streamer,
+                use_cache=True,
+                stopping_criteria=[stopping_criteria],
+                top_p=top_p,
+                )
+
+        outputs = tokenizer.decode(output_ids[0, input_ids.shape[1]:]).strip()
+        conv.messages[-1][-1] = outputs
+
+        return {
+            "image_file": image_file,
+            "input_text": request["prompt"],
+            "generated_text": outputs,
+        }
 
 
 app = FastAPI()
@@ -246,6 +372,12 @@ async def generate_stream(request: Request):
 @app.post("/worker_get_status")
 async def get_status(request: Request):
     return worker.get_status()
+
+@app.post("/process_image")
+async def process_image(request: Request):
+    data = await request.json()
+    response = worker.generate_image_caption(data)
+    return response
 
 
 if __name__ == "__main__":
