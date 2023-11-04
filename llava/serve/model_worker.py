@@ -82,6 +82,9 @@ class ModelWorker:
         self.device = device
         self.conv_mode = None
         logger.info(f"Loading the model {self.model_name} on worker {worker_id} ...")
+
+        print("model name : ", self.model_name)
+
         self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(
             model_path, model_base, self.model_name, load_8bit, load_4bit, device=self.device)
         self.is_multimodal = 'llava' in self.model_name.lower()

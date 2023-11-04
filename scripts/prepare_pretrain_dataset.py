@@ -7,7 +7,7 @@ wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
 # Create directories inside playground/ to store pretraining data if they don't exist
-PRETRAIN_DATA_DIR = '../playground/data/pretraining'
+PRETRAIN_DATA_DIR = 'playground/data/pretraining'
 
 if not os.path.exists(PRETRAIN_DATA_DIR):
     os.mkdir(PRETRAIN_DATA_DIR)
